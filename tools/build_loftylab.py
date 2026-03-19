@@ -10,7 +10,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable
-from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.parse import parse_qs, urljoin, urldefrag, urlparse
 
 import requests
 from lxml import html as lxml_html
@@ -42,6 +42,7 @@ USER_AGENT = (
 )
 
 REMOTE_URL_RE = re.compile(r"https?://[^\s\"'<>`\\)]+")
+FRAMER_ASSET_REFERENCE_RE = re.compile(r"data:framer/asset-reference,(?P<asset>[^\s\"'<>`]+)")
 RELATIVE_MODULE_RE = re.compile(
     r"""
     (?:from\s*["'](?P<from>[^"']+)["'])
@@ -100,6 +101,22 @@ LOCAL_FRAMER_CMS_IMPORT_META_RE = re.compile(
     \)
     """,
     re.VERBOSE,
+)
+
+MODULE_IMAGE_SRC_RE = re.compile(
+    r"(?P<key>\bsrc)\s*:\s*`(?P<path>\.\./\.\./images/[^`]+)`"
+)
+
+MODULE_IMAGE_SRCSET_RE = re.compile(
+    r"(?P<key>\bsrcSet)\s*:\s*`(?P<entries>\.\./\.\./images/[^`]+)`"
+)
+
+MODULE_TEMPLATE_CSS_URL_RE = re.compile(
+    r"`(?P<prefix>[^`$]*?)url\((?P<url_quote>['\"]?)(?P<path>(?:\.\./)+(?:images|media)/[^'\"`)]+)(?P=url_quote)\)(?P<suffix>[^`$]*?)`"
+)
+
+MODULE_ASSET_VALUE_RE = re.compile(
+    r"(?P<prefix>(?::|\?\?|\|\||\?|=|,|\[)\s*)(?P<quote>[\"'`])(?P<path>(?:\.\./)+(?:images|media)/[^\"'`\s)]+)(?P=quote)"
 )
 
 PAGE_URLS = {urljoin(BASE_URL, route.lstrip("/")) for route in ROUTES}
@@ -262,6 +279,16 @@ def extract_allowed_absolute_urls(text: str) -> set[str]:
     return allowed
 
 
+def extract_framer_asset_reference_urls(text: str) -> set[str]:
+    found: set[str] = set()
+    for match in FRAMER_ASSET_REFERENCE_RE.finditer(text):
+        asset = html.unescape(match.group("asset").strip())
+        if not asset:
+            continue
+        found.add(normalize_remote_url(asset, base="https://framerusercontent.com/images/"))
+    return found
+
+
 def extract_relative_dependencies(text: str, base_url: str) -> set[str]:
     found: set[str] = set()
     for match in RELATIVE_MODULE_RE.finditer(text):
@@ -301,6 +328,7 @@ def discover_assets(http: requests.Session, pages: Iterable[PageRecord]) -> dict
 
     for page in pages:
         queue.extend(sorted(extract_allowed_absolute_urls(page.html_text)))
+        queue.extend(sorted(extract_framer_asset_reference_urls(page.html_text)))
 
     while queue:
         remote_url = queue.pop(0)
@@ -325,6 +353,7 @@ def discover_assets(http: requests.Session, pages: Iterable[PageRecord]) -> dict
         if record.is_text:
             text = record.decode()
             queue.extend(sorted(extract_allowed_absolute_urls(text)))
+            queue.extend(sorted(extract_framer_asset_reference_urls(text)))
             queue.extend(sorted(extract_relative_dependencies(text, remote_url)))
 
     return assets
@@ -338,7 +367,99 @@ def replace_url_tokens(text: str, current_file: Path, target_map: dict[str, Path
     return text
 
 
-def postprocess_runtime_text(text: str) -> str:
+def framer_image_alias_name(remote_url: str) -> str | None:
+    parsed = urlparse(remote_url)
+    if parsed.netloc != "framerusercontent.com":
+        return None
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if parts[:1] != ["images"]:
+        return None
+    return PurePosixPath(parsed.path).name or None
+
+
+def framer_image_alias_score(remote_url: str) -> tuple[int, int, int, int]:
+    parsed = urlparse(remote_url)
+    query = parse_qs(parsed.query)
+
+    def query_int(name: str) -> int:
+        raw = query.get(name, ["0"])[0]
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    width = query_int("width")
+    height = query_int("height")
+    scale_down_to = query_int("scale-down-to")
+    area = width * height
+    return (area, scale_down_to, max(width, height), len(parsed.query))
+
+
+def write_framer_image_aliases(assets: dict[str, AssetRecord]) -> None:
+    best_records: dict[str, tuple[tuple[int, int, int, int], AssetRecord]] = {}
+
+    for record in assets.values():
+        alias_name = framer_image_alias_name(record.remote_url)
+        if not alias_name:
+            continue
+
+        score = framer_image_alias_score(record.remote_url)
+        current = best_records.get(alias_name)
+        if current is None or score > current[0]:
+            best_records[alias_name] = (score, record)
+
+    for alias_name, (_score, record) in best_records.items():
+        alias_path = ASSETS_ROOT / "framer" / "images" / alias_name
+        if alias_path == record.local_path:
+            continue
+        alias_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(record.local_path, alias_path)
+
+
+def rewrite_module_image_sources(text: str) -> str:
+    text = MODULE_IMAGE_SRC_RE.sub(
+        lambda match: (
+            f"{match.group('key')}:"
+            f"new URL(`{match.group('path')}`,import.meta.url).href"
+        ),
+        text,
+    )
+
+    def replace_srcset(match: re.Match[str]) -> str:
+        parts: list[str] = []
+        for entry in match.group("entries").split(","):
+            item = entry.strip()
+            if not item:
+                continue
+            image_path, _separator, descriptor = item.partition(" ")
+            expression = f"new URL(`{image_path}`,import.meta.url).href"
+            if descriptor:
+                expression += f"+` {descriptor}`"
+            parts.append(expression)
+        return f"{match.group('key')}:[{','.join(parts)}].join(`,`)"
+
+    return MODULE_IMAGE_SRCSET_RE.sub(replace_srcset, text)
+
+
+def rewrite_module_asset_values(text: str) -> str:
+    text = MODULE_TEMPLATE_CSS_URL_RE.sub(
+        lambda match: (
+            f"`{match.group('prefix')}"
+            f"url(${{new URL(`{match.group('path')}`,import.meta.url).href}})"
+            f"{match.group('suffix')}`"
+        ),
+        text,
+    )
+    return MODULE_ASSET_VALUE_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')}"
+            f"new URL(`{match.group('path')}`,import.meta.url).href"
+        ),
+        text,
+    )
+
+
+def postprocess_runtime_text(text: str, current_file: Path) -> str:
     for source, replacement in RUNTIME_TEXT_REPLACEMENTS.items():
         text = text.replace(source, replacement)
     text = LOCAL_FRAMER_CMS_RELATIVE_BASE_RE.sub(
@@ -352,6 +473,9 @@ def postprocess_runtime_text(text: str) -> str:
         lambda match: f"new URL({match.group('asset')},import.meta.url).href",
         text,
     )
+    if current_file.suffix in {".js", ".mjs"}:
+        text = rewrite_module_image_sources(text)
+        text = rewrite_module_asset_values(text)
     return text
 
 
@@ -418,10 +542,12 @@ def write_build(pages: Iterable[PageRecord], assets: dict[str, AssetRecord]) -> 
         record.local_path.parent.mkdir(parents=True, exist_ok=True)
         if record.is_text:
             rewritten = replace_url_tokens(record.decode(), record.local_path, asset_path_map)
-            rewritten = postprocess_runtime_text(rewritten)
+            rewritten = postprocess_runtime_text(rewritten, record.local_path)
             record.local_path.write_text(rewritten, encoding="utf-8")
         else:
             record.local_path.write_bytes(record.raw_bytes)
+
+    write_framer_image_aliases(assets)
 
     site_bundle_dir = ASSETS_ROOT / "framer" / "sites" / SITE_ID
     if site_bundle_dir.exists():

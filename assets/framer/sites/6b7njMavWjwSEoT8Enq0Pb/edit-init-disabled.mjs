@@ -1,1 +1,1 @@
-export async function createEditorBar() { return () => null; }
+export function createEditorBar() { return () => null; }

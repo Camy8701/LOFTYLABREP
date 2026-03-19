@@ -70,13 +70,13 @@ REMOTE_URL_RE = re.compile(r"https?://[^\s\"'<>`\\)]+")
 FRAMER_ASSET_REFERENCE_RE = re.compile(r"data:framer/asset-reference,(?P<asset>[^\s\"'<>`]+)")
 RELATIVE_MODULE_RE = re.compile(
     r"""
-    (?:from\s*["'](?P<from>[^"']+)["'])
+    (?:from\s*["'`](?P<from>[^"'`]+)["'`])
     |
-    (?:import\(\s*["'](?P<dynamic>[^"']+)["']\s*\))
+    (?:import\(\s*["'`](?P<dynamic>[^"'`]+)["'`]\s*\))
     |
-    (?:new\s+URL\(\s*["'](?P<newurl>[^"']+)["']\s*,\s*import\.meta\.url\s*\))
+    (?:new\s+URL\(\s*["'`](?P<newurl>[^"'`]+)["'`]\s*,\s*import\.meta\.url\s*\))
     |
-    (?:url\(\s*["']?(?P<css>[^"'()]+)["']?\s*\))
+    (?:url\(\s*["'`]?(?P<css>[^"'`()]+)["'`]?\s*\))
     """,
     re.VERBOSE,
 )
@@ -154,6 +154,66 @@ MODULE_TEMPLATE_CSS_URL_RE = re.compile(
 MODULE_ASSET_VALUE_RE = re.compile(
     r"(?P<prefix>(?::|\?\?|\|\||\?|=|,|\[)\s*)(?P<quote>[\"'`])(?P<path>(?:\.\./)+(?:images|media)/[^\"'`\s)]+)(?P=quote)"
 )
+
+SOURCE_MAP_COMMENT_RE = re.compile(
+    r"(?:\n?//# sourceMappingURL=[^\n]+)|(?:/\*# sourceMappingURL=.*?\*/\s*)",
+    re.DOTALL,
+)
+
+SNIPPETS_MODULE_RE = re.compile(
+    r"loadSnippetsModule:new\s+[A-Za-z0-9_$]+\(\(\)=>import\(`\./(?P<filename>[^`]+)`\)\)"
+)
+
+NOT_FOUND_PAGE_RE = re.compile(
+    r"notFoundPage:[A-Za-z0-9_$]+\(\(\)=>import\(`\./(?P<filename>[^`]+)`\)\)"
+)
+
+BADGE_MODULE_RE = re.compile(
+    r"__framer-badge-container`\),[^\n]*?import\(`\./(?P<filename>[^`]+)`\)"
+)
+
+COLLECTION_UTILS_RE = re.compile(
+    r"(?P<collection_id>[A-Za-z0-9_]+):async\(\)=>\(await import\(`\./(?P<filename>[^`]+)`\)\)\?\.utils"
+)
+
+BADGE_HYDRATION_RE = re.compile(
+    r"sr&&u\(\(\)=>\{C\(document\.getElementById\(`__framer-badge-container`\),w\(y,\{\},w\(ee\(\(\)=>import\(`\./[^`]+`\)\)\)\)\)\}\)"
+)
+
+EMPTY_SNIPPETS_MODULE = """const emptySnippets = {
+  bodyStart: [],
+  bodyEnd: [],
+  headStart: [],
+  headEnd: [],
+};
+
+export async function getSnippets() {
+  return emptySnippets;
+}
+
+export const snippetsSorting = {
+  bodyStart: [],
+  bodyEnd: [],
+  headStart: [],
+  headEnd: [],
+};
+
+export default { getSnippets, snippetsSorting };
+"""
+
+BADGE_DISABLED_MODULE = """export default function FramerBadge() {
+  return null;
+}
+"""
+
+NOT_FOUND_MODULE = """export default function NotFoundPage() {
+  return "Page not found";
+}
+
+export const queryParamNames = [];
+"""
+
+EMPTY_FONT_METADATA_MODULE = "export default {};\n"
 
 PAGE_URLS = {urljoin(BASE_URL, route.lstrip("/")) for route in ROUTES}
 PAGE_PATHS = {route for route in ROUTES}
@@ -336,6 +396,10 @@ def extract_relative_dependencies(text: str, base_url: str) -> set[str]:
         if candidate.startswith(("./", "../")):
             found.add(normalize_remote_url(candidate, base=base_url))
     return found
+
+
+def strip_source_map_comments(text: str) -> str:
+    return SOURCE_MAP_COMMENT_RE.sub("", text)
 
 
 def fetch_pages(http: requests.Session) -> list[PageRecord]:
@@ -524,17 +588,128 @@ def postprocess_runtime_text(text: str, current_file: Path) -> str:
         text,
     )
     if current_file.suffix in {".js", ".mjs"}:
+        text = BADGE_HYDRATION_RE.sub("sr&&u(()=>{})", text)
         text = rewrite_module_image_sources(text)
         text = rewrite_module_asset_values(text)
         text = rewrite_logo_component(text)
+    if current_file.suffix in {".css", ".js", ".mjs"}:
+        text = strip_source_map_comments(text)
     return text
+
+
+def ensure_local_runtime_nodes(doc: lxml_html.HtmlElement) -> None:
+    existing = doc.xpath("//*[@id='__framer-badge-container']")
+    if existing:
+        container = existing[0]
+        for child in list(container):
+            container.remove(child)
+        container.text = None
+        return
+    bodies = doc.xpath("//body")
+    if not bodies:
+        return
+    badge_container = lxml_html.Element("div")
+    badge_container.set("id", "__framer-badge-container")
+    bodies[0].append(badge_container)
+
+
+def build_collection_utils_wrapper(site_bundle_dir: Path, collection_id: str) -> str:
+    target = next(
+        (
+            candidate
+            for candidate in sorted(site_bundle_dir.glob(f"{collection_id}*.mjs"))
+            if candidate.name != f"{collection_id}.mjs"
+        ),
+        None,
+    )
+    if target is None:
+        return """export const utils = {
+  async getSlugByRecordId() {
+    return undefined;
+  },
+  async getRecordIdBySlug() {
+    return undefined;
+  },
+};
+
+export default { utils };
+"""
+    return f"""import * as collectionModule from "./{target.name}";
+
+const exportedUtils = Object.values(collectionModule).find(
+  (value) =>
+    value &&
+    typeof value.getSlugByRecordId === "function" &&
+    typeof value.getRecordIdBySlug === "function",
+);
+
+export const utils = exportedUtils ?? {{
+  async getSlugByRecordId() {{
+    return undefined;
+  }},
+  async getRecordIdBySlug() {{
+    return undefined;
+  }},
+}};
+
+export default {{ utils }};
+"""
+
+
+def write_runtime_support_modules(site_bundle_dir: Path) -> None:
+    script_main = next(iter(sorted(site_bundle_dir.glob("script_main*.mjs"))), None)
+    if script_main is None:
+        return
+
+    script_text = script_main.read_text(encoding="utf-8")
+
+    snippet_match = SNIPPETS_MODULE_RE.search(script_text)
+    if snippet_match:
+        (site_bundle_dir / snippet_match.group("filename")).write_text(
+            EMPTY_SNIPPETS_MODULE,
+            encoding="utf-8",
+        )
+
+    badge_match = BADGE_MODULE_RE.search(script_text)
+    if badge_match:
+        (site_bundle_dir / badge_match.group("filename")).write_text(
+            BADGE_DISABLED_MODULE,
+            encoding="utf-8",
+        )
+
+    not_found_match = NOT_FOUND_PAGE_RE.search(script_text)
+    if not_found_match:
+        not_found_path = site_bundle_dir / not_found_match.group("filename")
+        if not not_found_path.exists():
+            not_found_path.write_text(NOT_FOUND_MODULE, encoding="utf-8")
+
+    for match in COLLECTION_UTILS_RE.finditer(script_text):
+        collection_utils_path = site_bundle_dir / match.group("filename")
+        if collection_utils_path.exists():
+            continue
+        collection_utils_path.write_text(
+            build_collection_utils_wrapper(site_bundle_dir, match.group("collection_id")),
+            encoding="utf-8",
+        )
+
+    for site_module in sorted(site_bundle_dir.glob("*.mjs")):
+        text = site_module.read_text(encoding="utf-8")
+        for match in RELATIVE_MODULE_RE.finditer(text):
+            candidate = next(group for group in match.groups() if group)
+            if not candidate.startswith("./") or not candidate.endswith(".mjs"):
+                continue
+            module_path = site_bundle_dir / candidate[2:]
+            if module_path.exists():
+                continue
+            module_name = module_path.name
+            if module_name.startswith(("google-", "fontshare-", "framer-font-")):
+                module_path.write_text(EMPTY_FONT_METADATA_MODULE, encoding="utf-8")
 
 
 def prune_framer_nodes(doc: lxml_html.HtmlElement) -> None:
     xpaths = [
         "//script[contains(., 'framer.com/edit/init.mjs')]",
         "//script[starts-with(@src, 'https://events.framer.com/')]",
-        "//*[@id='__framer-badge-container']",
         "//link[@rel='canonical']",
         "//link[@rel='preconnect' and contains(@href, 'fonts.gstatic.com')]",
         "//meta[@name='framer-search-index']",
@@ -551,6 +726,7 @@ def prune_framer_nodes(doc: lxml_html.HtmlElement) -> None:
 def rewrite_page(page: PageRecord, asset_map: dict[str, Path]) -> str:
     doc = lxml_html.fromstring(page.html_text)
     prune_framer_nodes(doc)
+    ensure_local_runtime_nodes(doc)
 
     for element in doc.xpath("//*[@href]"):
         href = element.get("href")
@@ -604,9 +780,10 @@ def write_build(pages: Iterable[PageRecord], assets: dict[str, AssetRecord]) -> 
     site_bundle_dir = ASSETS_ROOT / "framer" / "sites" / SITE_ID
     if site_bundle_dir.exists():
         (site_bundle_dir / "edit-init-disabled.mjs").write_text(
-            "export async function createEditorBar() { return () => null; }\n",
+            "export function createEditorBar() { return () => null; }\n",
             encoding="utf-8",
         )
+        write_runtime_support_modules(site_bundle_dir)
 
     (PROJECT_ROOT / ".nojekyll").write_text("", encoding="utf-8")
     home_page = PROJECT_ROOT / "index.html"

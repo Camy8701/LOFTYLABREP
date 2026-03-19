@@ -18,6 +18,10 @@ from lxml import html as lxml_html
 
 BASE_URL = "https://loftylab.framer.website"
 SITE_ID = "6b7njMavWjwSEoT8Enq0Pb"
+BRAND_REPLACEMENTS = {
+    "Lofty Lab": "LYNCK Studio",
+    "loftylab@support.com": "lynckstudio@support.com",
+}
 ROUTES = [
     "/",
     "/about",
@@ -367,6 +371,12 @@ def replace_url_tokens(text: str, current_file: Path, target_map: dict[str, Path
     return text
 
 
+def apply_brand_replacements(text: str) -> str:
+    for source, target in BRAND_REPLACEMENTS.items():
+        text = text.replace(source, target)
+    return text
+
+
 def framer_image_alias_name(remote_url: str) -> str | None:
     parsed = urlparse(remote_url)
     if parsed.netloc != "framerusercontent.com":
@@ -528,7 +538,7 @@ def rewrite_page(page: PageRecord, asset_map: dict[str, Path]) -> str:
         doctype="<!doctype html>",
         method="html",
     )
-    return replace_url_tokens(rendered, page.local_path, asset_map)
+    return apply_brand_replacements(replace_url_tokens(rendered, page.local_path, asset_map))
 
 
 def write_build(pages: Iterable[PageRecord], assets: dict[str, AssetRecord]) -> None:
@@ -543,6 +553,7 @@ def write_build(pages: Iterable[PageRecord], assets: dict[str, AssetRecord]) -> 
         if record.is_text:
             rewritten = replace_url_tokens(record.decode(), record.local_path, asset_path_map)
             rewritten = postprocess_runtime_text(rewritten, record.local_path)
+            rewritten = apply_brand_replacements(rewritten)
             record.local_path.write_text(rewritten, encoding="utf-8")
         else:
             record.local_path.write_bytes(record.raw_bytes)

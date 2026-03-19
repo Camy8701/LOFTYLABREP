@@ -72,6 +72,36 @@ RUNTIME_TEXT_REPLACEMENTS = {
     "e.url.startsWith(`https://fonts.gstatic.com/s/`)?`google`": "e.url.includes(`/assets/fonts/`)?`google`",
 }
 
+LOCAL_FRAMER_CMS_RELATIVE_BASE_RE = re.compile(
+    r"""
+    new\ URL\(
+        (?P<asset>["'`]\./[^"'`]+\.framercms["'`])
+        \s*,\s*
+        (?P<base>["'`]\.\./[^"'`]+["'`])
+    \)\.href\.replace\(
+        ["'`]/modules/["'`]
+        \s*,\s*
+        ["'`]/cms/["'`]
+    \)
+    """,
+    re.VERBOSE,
+)
+
+LOCAL_FRAMER_CMS_IMPORT_META_RE = re.compile(
+    r"""
+    new\ URL\(
+        (?P<asset>["'`]\./[^"'`]+\.framercms["'`])
+        \s*,\s*
+        import\.meta\.url
+    \)\.href\.replace\(
+        ["'`]/modules/["'`]
+        \s*,\s*
+        ["'`]/cms/["'`]
+    \)
+    """,
+    re.VERBOSE,
+)
+
 PAGE_URLS = {urljoin(BASE_URL, route.lstrip("/")) for route in ROUTES}
 PAGE_PATHS = {route for route in ROUTES}
 
@@ -311,6 +341,17 @@ def replace_url_tokens(text: str, current_file: Path, target_map: dict[str, Path
 def postprocess_runtime_text(text: str) -> str:
     for source, replacement in RUNTIME_TEXT_REPLACEMENTS.items():
         text = text.replace(source, replacement)
+    text = LOCAL_FRAMER_CMS_RELATIVE_BASE_RE.sub(
+        lambda match: (
+            f"new URL({match.group('asset')},"
+            f"new URL({match.group('base')},import.meta.url)).href"
+        ),
+        text,
+    )
+    text = LOCAL_FRAMER_CMS_IMPORT_META_RE.sub(
+        lambda match: f"new URL({match.group('asset')},import.meta.url).href",
+        text,
+    )
     return text
 
 

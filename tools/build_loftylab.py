@@ -19,9 +19,30 @@ from lxml import html as lxml_html
 BASE_URL = "https://loftylab.framer.website"
 SITE_ID = "6b7njMavWjwSEoT8Enq0Pb"
 BRAND_REPLACEMENTS = {
+    "LOFTY LAB": "LYNCK Studio",
     "Lofty Lab": "LYNCK Studio",
+    "loftylab@email.com": "lynckstudio@support.com",
     "loftylab@support.com": "lynckstudio@support.com",
 }
+LOGO_COMPONENT_RULE_OLD = (
+    "`.framer-30Q4Y { -webkit-mask: ${w}; aspect-ratio: 2.3225806451612905; "
+    "background-color: var(--token-0e3df59a-d2bd-4221-885a-76d4a23fa9fa, #030f2e); "
+    "mask: ${w}; width: 72px; }`"
+)
+LOGO_COMPONENT_RULE_NEW = (
+    "`.framer-30Q4Y { align-items: flex-start; display: flex; flex-direction: column; "
+    "gap: 0px; height: 100%; justify-content: center; width: 100%; }`,"
+    "`.framer-30Q4Y::before { content: \"LYNCK\"; color: "
+    "var(--token-0e3df59a-d2bd-4221-885a-76d4a23fa9fa, #030f2e); font-family: "
+    "\"Inter Display\", \"Inter Display Placeholder\", sans-serif; font-size: 14px; "
+    "font-style: normal; font-weight: 900; letter-spacing: -0.08em; line-height: 0.82; "
+    "text-transform: uppercase; }`,"
+    "`.framer-30Q4Y::after { content: \"Studio\"; color: "
+    "var(--token-0e3df59a-d2bd-4221-885a-76d4a23fa9fa, #030f2e); font-family: "
+    "\"Inter Display\", \"Inter Display Placeholder\", sans-serif; font-size: 12px; "
+    "font-style: normal; font-weight: 800; letter-spacing: -0.06em; line-height: 0.88; "
+    "margin-top: -1px; text-transform: none; }`"
+)
 ROUTES = [
     "/",
     "/about",
@@ -480,6 +501,12 @@ def rewrite_module_asset_values(text: str) -> str:
     )
 
 
+def rewrite_logo_component(text: str) -> str:
+    if LOGO_COMPONENT_RULE_OLD not in text:
+        return text
+    return text.replace(LOGO_COMPONENT_RULE_OLD, LOGO_COMPONENT_RULE_NEW)
+
+
 def postprocess_runtime_text(text: str, current_file: Path) -> str:
     for source, replacement in RUNTIME_TEXT_REPLACEMENTS.items():
         text = text.replace(source, replacement)
@@ -499,6 +526,7 @@ def postprocess_runtime_text(text: str, current_file: Path) -> str:
     if current_file.suffix in {".js", ".mjs"}:
         text = rewrite_module_image_sources(text)
         text = rewrite_module_asset_values(text)
+        text = rewrite_logo_component(text)
     return text
 
 

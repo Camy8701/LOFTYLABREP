@@ -77,6 +77,17 @@ RUNTIME_TEXT_REPLACEMENTS = {
     "e.url.startsWith(`https://fonts.gstatic.com/s/`)?`google`": "e.url.includes(`/assets/fonts/`)?`google`",
 }
 
+CMS_RANGE_RESPONSE_REPLACEMENTS = (
+    (
+        "let u=await o.arrayBuffer(),l=new Uint8Array(u);if(l.length!==i)throw Error(\"Request failed: Unexpected response length\");let h=new tT,c=0;for(let t of r){let e=t.to-t.from,r=c+e,n=l.subarray(c,r);h.write(t.from,n),c=r;}return e.map(t=>h.read(t.from,t.to-t.from));",
+        "let u=await o.arrayBuffer(),l=new Uint8Array(u);if(l.length!==i){let n=r.reduce((t,e)=>Math.max(t,e.to),0);if(l.length<n)throw Error(\"Request failed: Unexpected response length\");return e.map(t=>l.slice(t.from,t.to));}let h=new tT,c=0;for(let t of r){let e=t.to-t.from,r=c+e,n=l.subarray(c,r);h.write(t.from,n),c=r;}return e.map(t=>h.read(t.from,t.to-t.from));",
+    ),
+    (
+        "let c=await s.arrayBuffer(),l=new Uint8Array(c);if(l.length!==i)throw Error(`Request failed: Unexpected response length`);let u=new $e,d=0;for(let e of n){let t=e.to-e.from,n=d+t,r=l.subarray(d,n);u.write(e.from,r),d=n}return t.map(e=>u.read(e.from,e.to-e.from))",
+        "let c=await s.arrayBuffer(),l=new Uint8Array(c);if(l.length!==i){let r=n.reduce((e,t)=>Math.max(e,t.to),0);if(l.length<r)throw Error(`Request failed: Unexpected response length`);return t.map(e=>l.slice(e.from,e.to))}let u=new $e,d=0;for(let e of n){let t=e.to-e.from,n=d+t,r=l.subarray(d,n);u.write(e.from,r),d=n}return t.map(e=>u.read(e.from,e.to-e.from))",
+    ),
+)
+
 LOCAL_FRAMER_CMS_RELATIVE_BASE_RE = re.compile(
     r"""
     new\ URL\(
@@ -471,6 +482,8 @@ def rewrite_module_asset_values(text: str) -> str:
 
 def postprocess_runtime_text(text: str, current_file: Path) -> str:
     for source, replacement in RUNTIME_TEXT_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
+    for source, replacement in CMS_RANGE_RESPONSE_REPLACEMENTS:
         text = text.replace(source, replacement)
     text = LOCAL_FRAMER_CMS_RELATIVE_BASE_RE.sub(
         lambda match: (
